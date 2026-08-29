@@ -1,0 +1,35 @@
+# Local secrets and OCI identity — never commit
+.env
+.env.oci
+.env.*
+!.env.oci.example
+!.env.example
+
+# OCI API signing keys
+*.pem
+oci_api_key*
+oci_api_key.pem
+oci_api_key_public.pem
+
+# Copied OCI config (keep real config in ~/.oci only)
+.oci/
+config
+config.bak
+
+# SSH private keys
+id_rsa
+id_ed25519
+*.key
+
+# Runtime / local state (keep empty dir via .gitkeep)
+.gpu-state/*
+!.gpu-state/.gitkeep
+*.log
+__pycache__/
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*~
