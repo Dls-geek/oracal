@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+# oci-watchdog — guard Oracle Free Trial promo credits
+# Start before work, stop when idle, kill before the trial ends.
+# Never upgrades or adds a payment method.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${WATCHDOG_ENV_FILE:-${GPU_ENV_FILE:-$ROOT/.env.oci}}"
+STATE_DIR="${WATCHDOG_STATE_DIR:-$ROOT/.watchdog-state}"
+# Compat with older checkouts
+[[ -d "$STATE_DIR" ]] || STATE_DIR="${GPU_STATE_DIR:-$ROOT/.gpu-state}"
+mkdir -p "$STATE_DIR"
+
+die() { echo "error: $*" >&2; exit 1; }
+info() { echo "$*"; }
+warn() { echo "warning: $*" >&2; }
+
+load_env() {
+  if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    set -a
+    # shellcheck source=/dev/null
+    source "$ENV_FILE"
+    set +a
+  fi
+  HOME_REGION="${HOME_REGION:-${OCI_CLI_REGION:-}}"
+  SSH_USER="${SSH_USER:-ubuntu}"
+  SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+  TRIAL_DAYS="${TRIAL_DAYS:-30}"
+  TRIAL_CREDITS_USD="${TRIAL_CREDITS_USD:-300}"
+  # Prefer HOURLY_USD; keep A10_USD_PER_HOUR as legacy alias
+  HOURLY_USD="${HOURLY_USD:-${A10_USD_PER_HOUR:-2.00}}"
+  SHAPE_LABEL="${SHAPE_LABEL:-compute}"
+  OCI_BIN="${OCI_BIN:-oci}"
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' not found. Install it first (see README)."
+}
+
+oci_cmd() {
+  need_cmd "$OCI_BIN"
+  local args=()
+  if [[ -n "${OCI_CLI_PROFILE:-}" ]]; then
+    args+=(--profile "$OCI_CLI_PROFILE")
+  fi
+  if [[ -n "${HOME_REGION:-}" ]]; then
+    args+=(--region "$HOME_REGION")
+  fi
+  "$OCI_BIN" "${args[@]}" "$@"
+}
+
+require_instance() {
+  [[ -n "${INSTANCE_OCID:-}" && "$INSTANCE_OCID" != *REPLACE* ]] \
+    || die "INSTANCE_OCID missing. Copy .env.oci.example → .env.oci and set your instance OCID."
+}
+
+usage() {
+  cat <<'EOF'
+oci-watchdog — Oracle Free Trial credit guard
+
+Usage: ./bin/watchdog <command>
+
+  start     Start the watched instance (credits apply while RUNNING)
+  stop      Stop the instance (hourly burn pauses; boot disk remains)
+  status    VM state, public IP, trial clock, credit estimate
+  credits   Trial clock + credit / hours estimate only
+  ssh       SSH into the instance
+  tunnel    Forward local 11434 → VM Ollama (keep terminal open)
+  kill      TERMINATE instance and DELETE boot volume (confirm: DELETE)
+  help      Show this help
+
+Config: .env.oci (see .env.oci.example). Never commit secrets.
+Safety: this tool never calls Upgrade or payment APIs.
+EOF
+}
+
+trial_end_epoch() {
+  [[ -n "${TRIAL_START:-}" && "$TRIAL_START" != YYYY-MM-DD ]] || return 1
+  local start end
+  if ! start=$(date -d "$TRIAL_START" +%s 2>/dev/null); then
+    start=$(date -j -f "%Y-%m-%d" "$TRIAL_START" +%s 2>/dev/null) || return 1
+  fi
+  end=$((start + TRIAL_DAYS * 86400))
+  echo "$end"
+}
+
+print_trial_clock() {
+  local end now left days hours
+  if ! end=$(trial_end_epoch); then
+    warn "TRIAL_START not set (YYYY-MM-DD). Set it from Console → Billing → Subscription."
+    return 0
+  fi
+  now=$(date +%s)
+  left=$((end - now))
+  if (( left <= 0 )); then
+    echo "Trial time: EXPIRED (started $TRIAL_START, ${TRIAL_DAYS}d window)"
+    echo "Action: run './bin/watchdog kill' if the instance still exists — do NOT Upgrade."
+    return 0
+  fi
+  days=$((left / 86400))
+  hours=$(((left % 86400) / 3600))
+  echo "Trial time: ${days}d ${hours}h left (start $TRIAL_START, ${TRIAL_DAYS}d window)"
+  if (( days < 3 )); then
+    warn "Fewer than 3 days left. Stop when idle; './bin/watchdog kill' before trial ends."
+  fi
+}
+
+fetch_cost_used_usd() {
+  local tenant="${TENANCY_OCID:-}"
+  [[ -n "$tenant" && "$tenant" != *REPLACE* ]] || return 0
+
+  local start end json used
+  start="${TRIAL_START:-}"
+  [[ -n "$start" && "$start" != YYYY-MM-DD ]] || start=$(date -d '30 days ago' +%Y-%m-%d 2>/dev/null || date -v-30d +%Y-%m-%d)
+  end=$(date -u +%Y-%m-%d)
+
+  json=$(oci_cmd usage-api usage-summary request-summarized-usages \
+    --tenant-id "$tenant" \
+    --granularity DAILY \
+    --query-type COST \
+    --time-usage-started "${start}T00:00:00.000Z" \
+    --time-usage-ended "${end}T23:59:59.000Z" \
+    --compartment-depth 1 \
+    2>/dev/null || true)
+
+  [[ -n "$json" ]] || return 0
+
+  if command -v python3 >/dev/null 2>&1; then
+    used=$(printf '%s' "$json" | python3 -c '
+import json,sys
+try:
+  d=json.load(sys.stdin)
+except Exception:
+  sys.exit(0)
+items=d.get("data",{}).get("items") or d.get("data") or []
+if isinstance(items, dict):
+  items=[items]
+total=0.0
+for it in items:
+  if not isinstance(it, dict):
+    continue
+  for k in ("computed-amount","computedAmount","cost","amount"):
+    if k in it and it[k] is not None:
+      try: total += float(it[k])
+      except Exception: pass
+      break
+print(f"{total:.4f}" if total else "")
+' 2>/dev/null || true)
+  fi
+  [[ -n "${used:-}" ]] && echo "$used"
+}
+
+print_credits_block() {
+  print_trial_clock
+  local used remaining hours rate
+  rate="$HOURLY_USD"
+  used=$(fetch_cost_used_usd || true)
+  if [[ -n "${used:-}" ]]; then
+    remaining=$(python3 -c "print(max(0, float('$TRIAL_CREDITS_USD') - float('$used')))" 2>/dev/null \
+      || awk "BEGIN{u=$used;t=$TRIAL_CREDITS_USD; r=t-u; if(r<0)r=0; print r}")
+    hours=$(python3 -c "print(round(float('$remaining')/float('$rate'),1))" 2>/dev/null \
+      || awk "BEGIN{print $remaining/$rate}")
+    echo "Credits: ~\$${remaining} left of \$${TRIAL_CREDITS_USD} (used ~\$${used} this period)"
+    echo "Est. ${SHAPE_LABEL} hours left @ \$${rate}/hr: ~${hours}h"
+  else
+    hours=$(python3 -c "print(round(float('$TRIAL_CREDITS_USD')/float('$rate'),1))" 2>/dev/null \
+      || awk "BEGIN{print $TRIAL_CREDITS_USD/$rate}")
+    if [[ -z "${TENANCY_OCID:-}" || "$TENANCY_OCID" == *REPLACE* ]]; then
+      echo "Credits: set TENANCY_OCID in .env.oci for live Usage API estimates; default budget \$${TRIAL_CREDITS_USD}"
+    else
+      echo "Credits: Usage API unavailable or empty (common on Free Tier). Budget \$${TRIAL_CREDITS_USD} — check Cost Analysis in Console."
+    fi
+    echo "Est. ${SHAPE_LABEL} hours if unused @ \$${rate}/hr: ~${hours}h (actual = remaining credits / rate)"
+    echo "Tip: Console → Billing & Cost Management → Cost Analysis for exact promo balance."
+  fi
+  echo "Watchdog: stop when idle; kill before trial end. './bin/watchdog stop' · './bin/watchdog kill'"
+}
+
+get_instance_json() {
+  require_instance
+  oci_cmd compute instance get --instance-id "$INSTANCE_OCID"
+}
+
+get_lifecycle() {
+  get_instance_json | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print(d["data"]["lifecycle-state"])
+' 2>/dev/null || get_instance_json | sed -n 's/.*"lifecycle-state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+}
+
+get_public_ip() {
+  if [[ -n "${PUBLIC_IP:-}" ]]; then
+    echo "$PUBLIC_IP"
+    return 0
+  fi
+  require_instance
+  local compartment="${COMPARTMENT_OCID:-}"
+  [[ -n "$compartment" && "$compartment" != *REPLACE* ]] || die "COMPARTMENT_OCID required to discover PUBLIC_IP (or set PUBLIC_IP in .env.oci)"
+
+  local vnic_id
+  vnic_id=$(oci_cmd compute instance list-vnics \
+    --instance-id "$INSTANCE_OCID" \
+    --compartment-id "$compartment" \
+    --query 'data[0].id' --raw-output 2>/dev/null || true)
+  [[ -n "$vnic_id" && "$vnic_id" != "null" ]] || return 1
+
+  oci_cmd network vnic get --vnic-id "$vnic_id" \
+    --query 'data."public-ip"' --raw-output 2>/dev/null || true
+}
+
+wait_state() {
+  local want="$1" tries="${2:-60}" i state
+  for ((i=1; i<=tries; i++)); do
+    state=$(get_lifecycle || echo UNKNOWN)
+    echo "  state: $state ($i/$tries)"
+    [[ "$state" == "$want" ]] && return 0
+    if [[ "$want" == "TERMINATED" && ( "$state" == "TERMINATING" || "$state" == "TERMINATED" ) ]]; then
+      [[ "$state" == "TERMINATED" ]] && return 0
+    fi
+    sleep 10
+  done
+  die "timed out waiting for $want (last=$state)"
+}
+
+clear_instance_from_env() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  awk '
+    /^INSTANCE_OCID=/ { print "# cleared after kill — " $0; print "INSTANCE_OCID="; print "KILLED=1"; next }
+    /^KILLED=/ { next }
+    { print }
+  ' "$ENV_FILE" >"$tmp"
+  mv "$tmp" "$ENV_FILE"
+  info "Cleared INSTANCE_OCID in $ENV_FILE (KILLED=1)."
+}
+
+cmd_start() {
+  load_env
+  require_instance
+  need_cmd "$OCI_BIN"
+  if [[ "${KILLED:-0}" == "1" ]]; then
+    die "INSTANCE was killed (KILLED=1). Create a new instance and set INSTANCE_OCID again."
+  fi
+  local state
+  state=$(get_lifecycle || echo UNKNOWN)
+  info "Current state: $state"
+  if [[ "$state" == "RUNNING" ]]; then
+    info "Already RUNNING."
+  else
+    info "Starting instance (promo credits apply while RUNNING)..."
+    oci_cmd compute instance action --instance-id "$INSTANCE_OCID" --action START --wait-for-state RUNNING >/dev/null \
+      || { oci_cmd compute instance action --instance-id "$INSTANCE_OCID" --action START >/dev/null; wait_state RUNNING; }
+  fi
+  local ip
+  ip=$(get_public_ip || true)
+  info "Public IP: ${ip:-"(set PUBLIC_IP or wait for VNIC)"}"
+  if [[ -n "$ip" ]]; then
+    echo "$ip" >"$STATE_DIR/public_ip"
+  fi
+  print_credits_block
+}
+
+cmd_stop() {
+  load_env
+  require_instance
+  need_cmd "$OCI_BIN"
+  info "Stopping instance (hourly burn pauses)..."
+  oci_cmd compute instance action --instance-id "$INSTANCE_OCID" --action STOP --wait-for-state STOPPED >/dev/null \
+    || { oci_cmd compute instance action --instance-id "$INSTANCE_OCID" --action SOFTSTOP >/dev/null || \
+         oci_cmd compute instance action --instance-id "$INSTANCE_OCID" --action STOP >/dev/null; wait_state STOPPED; }
+  info "Stopped."
+  print_credits_block
+}
+
+cmd_status() {
+  load_env
+  if [[ -n "${INSTANCE_OCID:-}" && "$INSTANCE_OCID" != *REPLACE* ]]; then
+    need_cmd "$OCI_BIN"
+    local state ip
+    state=$(get_lifecycle || echo UNKNOWN)
+    ip=$(get_public_ip || true)
+    [[ -z "$ip" && -f "$STATE_DIR/public_ip" ]] && ip=$(cat "$STATE_DIR/public_ip")
+    echo "Instance: $INSTANCE_OCID"
+    echo "Region:   ${HOME_REGION:-"(default from ~/.oci/config)"}"
+    echo "State:    $state"
+    echo "Public IP:${ip:- unknown}"
+  else
+    echo "Instance: (not configured — copy .env.oci.example → .env.oci)"
+  fi
+  echo "---"
+  print_credits_block
+}
+
+cmd_credits() {
+  load_env
+  print_credits_block
+}
+
+resolve_ip() {
+  local ip
+  ip=$(get_public_ip || true)
+  [[ -z "$ip" && -f "$STATE_DIR/public_ip" ]] && ip=$(cat "$STATE_DIR/public_ip")
+  [[ -n "$ip" ]] || die "No public IP. Start the instance and set PUBLIC_IP if needed."
+  echo "$ip"
+}
+
+cmd_ssh() {
+  load_env
+  require_instance
+  need_cmd ssh
+  local ip
+  ip=$(resolve_ip)
+  local key_args=()
+  [[ -f "${SSH_KEY/#\~/$HOME}" ]] && key_args=(-i "${SSH_KEY/#\~/$HOME}")
+  exec ssh "${key_args[@]}" -o StrictHostKeyChecking=accept-new "${SSH_USER}@${ip}" "$@"
+}
+
+cmd_tunnel() {
+  load_env
+  require_instance
+  need_cmd ssh
+  local ip
+  ip=$(resolve_ip)
+  local key_args=()
+  [[ -f "${SSH_KEY/#\~/$HOME}" ]] && key_args=(-i "${SSH_KEY/#\~/$HOME}")
+  info "Tunnel: localhost:11434 → ${SSH_USER}@${ip}:11434"
+  info "Point Hermes / OpenAI clients at http://127.0.0.1:11434/v1"
+  info "Ctrl+C to close. When done working: ./bin/watchdog stop"
+  exec ssh "${key_args[@]}" -N -L 11434:127.0.0.1:11434 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${ip}"
+}
+
+cmd_kill() {
+  load_env
+  require_instance
+  need_cmd "$OCI_BIN"
+  echo "This will TERMINATE the instance and DELETE the boot volume."
+  echo "Your Oracle account stays; the watched VM will be gone (use before trial ends)."
+  echo "Instance: $INSTANCE_OCID"
+  if [[ "${1:-}" != "--yes" ]]; then
+    printf "Type DELETE to confirm: "
+    read -r confirm
+    [[ "$confirm" == "DELETE" ]] || die "aborted"
+  else
+    warn "--yes supplied; skipping interactive confirm"
+  fi
+  info "Terminating (preserve-boot-volume=false)..."
+  oci_cmd compute instance terminate \
+    --instance-id "$INSTANCE_OCID" \
+    --preserve-boot-volume false \
+    --force \
+    >/dev/null 2>&1 \
+    || oci_cmd compute instance terminate \
+         --instance-id "$INSTANCE_OCID" \
+         --preserve-boot-volume false \
+         --force
+  wait_state TERMINATED 90 || warn "Could not confirm TERMINATED; check Console."
+  clear_instance_from_env
+  rm -f "$STATE_DIR/public_ip"
+  info "Kill complete. Do NOT Upgrade."
+  print_trial_clock || true
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    start)   cmd_start "$@" ;;
+    stop)    cmd_stop "$@" ;;
+    status)  cmd_status "$@" ;;
+    credits) cmd_credits "$@" ;;
+    ssh)     cmd_ssh "$@" ;;
+    tunnel)  cmd_tunnel "$@" ;;
+    kill)    cmd_kill "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

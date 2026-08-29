@@ -21,7 +21,9 @@ id_rsa
 id_ed25519
 *.key
 
-# Runtime / local state (keep empty dir via .gitkeep)
+# Runtime / local state
+.watchdog-state/*
+!.watchdog-state/.gitkeep
 .gpu-state/*
 !.gpu-state/.gitkeep
 *.log
